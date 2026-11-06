@@ -59,3 +59,11 @@ Firebase Admin SDK on the server authenticates using the service account and acc
 - `Unlimited` means no automatic punishment based on the link counter; link deletion and warning recording remain active.
 - Warning thresholds are checked at their exact configured count. Keep thresholds distinct and increasing (e.g. mute 3, ban 5, kick 7).
 - This is a starter implementation and should be tested before using it in a large public group.
+
+
+## Updated features (v2)
+- Group Settings and Moderation can be opened in private chat; the bot lists active groups where the user is a Telegram admin.
+- Moderation supports Warn, Mute, Unmute, Ban, Unban, and Kick by numeric Telegram user ID.
+- Group creator receives a private moderation alert for warnings and punishments, with quick Unmute/Unban buttons when applicable.
+- The group creator must first open the bot privately and send `/start`; Telegram does not let bots initiate private conversations.
+- Keep the bot as group admin with Delete Messages, Restrict Members, Ban Users, and Pin Messages permissions as needed.

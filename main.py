@@ -127,6 +127,57 @@ def list_groups():
     data = ref("groups").get() or {}
     return [v for v in data.values() if isinstance(v, dict) and v.get("active")]
 
+async def groups_for_admin(context, user_id):
+    """Return active groups where this Telegram user is an administrator."""
+    result = []
+    for group in list_groups():
+        try:
+            if await is_admin(context, int(group["chat_id"]), user_id):
+                result.append(group)
+        except Exception:
+            continue
+    return result
+
+def group_picker(groups, prefix):
+    buttons = []
+    for g in groups[:60]:
+        cid = int(g["chat_id"])
+        title = (g.get("title") or str(cid))[:45]
+        buttons.append([InlineKeyboardButton(title, callback_data=f"{prefix}:{cid}")])
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+async def notify_group_creator(context, chat_id, target_id, action, details=""):
+    """DM the Telegram group creator; creator must have opened the bot privately first."""
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        creator = next((m.user for m in admins if m.status == "creator"), None)
+        if not creator:
+            return
+        try:
+            target = await context.bot.get_chat(target_id)
+            username = ("@" + target.username) if target.username else "No username"
+            full_name = target.full_name
+        except TelegramError:
+            username, full_name = "Unavailable", "Unknown user"
+        chat = await context.bot.get_chat(chat_id)
+        text = (
+            "🛡 ORVIX MODERATION ALERT\\n\\n"
+            f"Group: {chat.title or chat_id}\\n"
+            f"User: {full_name} ({username})\\n"
+            f"Telegram ID: {target_id}\\n"
+            f"Action: {action.upper()}\\n"
+            f"Details: {details or '—'}"
+        )
+        rows = []
+        if action == "mute":
+            rows.append([InlineKeyboardButton("🔊 Unmute User", callback_data=f"owneract:unmute:{chat_id}:{target_id}")])
+        elif action == "ban":
+            rows.append([InlineKeyboardButton("🔓 Unban User", callback_data=f"owneract:unban:{chat_id}:{target_id}")])
+        rows.append([InlineKeyboardButton("👤 View Telegram Profile", url=f"tg://user?id={target_id}")])
+        await context.bot.send_message(creator.id, text, reply_markup=InlineKeyboardMarkup(rows))
+    except TelegramError as exc:
+        log.info("Could not notify group creator for %s: %s", chat_id, exc)
+
 def group_link_count(chat_id, user_id):
     return int(ref(f"link_violations/{chat_id}/{user_id}/count").get() or 0)
 
@@ -218,6 +269,7 @@ async def apply_punishment(context, chat_id, user_id, action, reason):
         else:
             return False
         log_action(chat_id, None, user_id, action, reason)
+        await notify_group_creator(context, chat_id, user_id, action, reason)
         return True
     except TelegramError as exc:
         log.warning("Punishment failed: %s", exc)
@@ -230,6 +282,7 @@ async def evaluate_warning_actions(context, chat_id, user_id, count):
         threshold = s.get(f"{action}_at")
         if threshold and int(threshold) == count:
             ok = await apply_punishment(context, chat_id, user_id, action, f"Reached {count} warnings")
+            await notify_group_creator(context, chat_id, user_id, "warn", f"Warning threshold reached: {count}; {action.upper()} {'applied' if ok else 'failed'}")
             try:
                 await context.bot.send_message(chat_id, f"⚠️ User {user_id}: {action.upper()} {'applied' if ok else 'failed'} after {count} warnings.")
             except TelegramError:
@@ -313,6 +366,7 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     links = add_link_violation(chat.id, user.id)
     warning_count = add_warning(chat.id, user.id)
     log_action(chat.id, None, user.id, "link_removed", f"link_count={links}; warnings={warning_count}")
+    await notify_group_creator(context, chat.id, user.id, "warn", f"Link removed; warning {warning_count}; link violations {links}")
     try:
         await context.bot.send_message(chat.id, f"⚠️ Link removed. User ID: {user.id}. Warning: {warning_count}")
     except TelegramError:
@@ -389,6 +443,49 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data
     user_id = q.from_user.id
+
+    # Personal-chat group selection and creator quick actions
+    if data.startswith("pm_settings:"):
+        chat_id = int(data.split(":")[1])
+        if not await is_admin(context, chat_id, user_id):
+            await q.answer("Only this group's admins.", show_alert=True); return
+        await q.edit_message_text("🛡 Group Settings:", reply_markup=settings_kb(chat_id, get_settings(chat_id)))
+        return
+
+    if data.startswith("pm_mod:"):
+        chat_id = int(data.split(":")[1])
+        if not await is_admin(context, chat_id, user_id):
+            await q.answer("Only this group's admins.", show_alert=True); return
+        WIZARD[user_id] = {"step": "moderation_target", "destination": chat_id, "private": True}
+        await q.edit_message_text(f"Target user ka numeric Telegram ID bhejein. Group: {chat_id}\\nCancel: /cancel")
+        return
+
+    if data.startswith("owneract:"):
+        _, action, chat_s, target_s = data.split(":")
+        chat_id, target_id = int(chat_s), int(target_s)
+        if not await is_admin(context, chat_id, user_id):
+            await q.answer("Sirf group admins ye action kar sakte hain.", show_alert=True); return
+        try:
+            if action == "unmute":
+                await context.bot.restrict_chat_member(
+                    chat_id, target_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=True, can_send_audios=True, can_send_documents=True,
+                        can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+                        can_send_voice_notes=True, can_send_polls=True, can_add_web_page_previews=True,
+                        can_change_info=False, can_invite_users=True, can_pin_messages=False,
+                        can_manage_topics=False
+                    )
+                )
+                log_action(chat_id, user_id, target_id, "unmute", "Creator quick action")
+                await q.edit_message_text("✅ User unmuted.")
+            elif action == "unban":
+                await context.bot.unban_chat_member(chat_id, target_id, only_if_banned=True)
+                log_action(chat_id, user_id, target_id, "unban", "Creator quick action")
+                await q.edit_message_text("✅ User unbanned.")
+        except TelegramError as exc:
+            await q.edit_message_text(f"Action failed: {exc}")
+        return
 
     if data == "bc_cancel":
         WIZARD.pop(user_id, None)
@@ -527,6 +624,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if action == "warn":
                 count = add_warning(chat_id, target_id)
                 log_action(chat_id, user_id, target_id, "warn", f"warnings={count}")
+                await notify_group_creator(context, chat_id, target_id, "warn", f"Manual warning; total warnings: {count}")
                 await q.edit_message_text(f"Warning recorded. Total: {count}")
                 await evaluate_warning_actions(context, chat_id, target_id, count)
             elif action in ("mute", "ban", "kick"):
@@ -536,6 +634,18 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.unban_chat_member(chat_id, target_id, only_if_banned=True)
                 log_action(chat_id, user_id, target_id, "unban")
                 await q.edit_message_text("User unbanned.")
+            elif action == "unmute":
+                await context.bot.restrict_chat_member(
+                    chat_id, target_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=True, can_send_audios=True, can_send_documents=True,
+                        can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+                        can_send_voice_notes=True, can_send_polls=True, can_add_web_page_previews=True,
+                        can_invite_users=True
+                    )
+                )
+                log_action(chat_id, user_id, target_id, "unmute")
+                await q.edit_message_text("User unmuted.")
         except TelegramError as exc:
             await q.edit_message_text(f"Action failed: {exc}")
         return
@@ -584,7 +694,7 @@ async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_preview(msg, state)
             return
         if step == "setting_text":
-            if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not await is_admin(context, state["destination"], user.id):
+            if not await is_admin(context, state["destination"], user.id):
                 WIZARD.pop(user.id, None)
                 await msg.reply_text("Only that group's admins can change settings.")
                 return
@@ -611,12 +721,26 @@ async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await msg.reply_text("Group broadcast is available to group admins inside their group.")
     elif text == "🛡 Group Settings":
-        if await require_group_admin(update, context):
-            await msg.reply_text("Group settings (managed by this group's admins):", reply_markup=settings_kb(chat.id, get_settings(chat.id)))
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            if await require_group_admin(update, context):
+                await msg.reply_text("Group settings:", reply_markup=settings_kb(chat.id, get_settings(chat.id)))
+        else:
+            groups = await groups_for_admin(context, user.id)
+            if not groups:
+                await msg.reply_text("Koi active group nahi mila jahan aap admin hon. Bot ko group mein add karke /start karein.")
+            else:
+                await msg.reply_text("Personal chat se kis group ki settings kholni hain?", reply_markup=group_picker(groups, "pm_settings"))
     elif text == "⚠️ Moderation":
-        if await require_group_admin(update, context):
-            WIZARD[user.id] = {"step": "moderation_target", "destination": chat.id}
-            await msg.reply_text("Target user ka numeric Telegram ID bhejein. Cancel: /cancel")
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            if await require_group_admin(update, context):
+                WIZARD[user.id] = {"step": "moderation_target", "destination": chat.id}
+                await msg.reply_text("Target user ka numeric Telegram ID bhejein. Cancel: /cancel")
+        else:
+            groups = await groups_for_admin(context, user.id)
+            if not groups:
+                await msg.reply_text("Koi active group nahi mila jahan aap admin hon.")
+            else:
+                await msg.reply_text("Moderation ke liye group select karein:", reply_markup=group_picker(groups, "pm_mod"))
     elif text == "📊 Statistics":
         if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and await require_group_admin(update, context):
             logs = ref(f"moderation_logs/{chat.id}").get() or {}
@@ -643,11 +767,13 @@ async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("🔇 Mute 1h", callback_data=f"mod:mute:{chat_id}:{target_id}")],
             [InlineKeyboardButton("🚫 Ban", callback_data=f"mod:ban:{chat_id}:{target_id}"),
              InlineKeyboardButton("👢 Kick", callback_data=f"mod:kick:{chat_id}:{target_id}")],
-            [InlineKeyboardButton("🔓 Unban", callback_data=f"mod:unban:{chat_id}:{target_id}")]
+            [InlineKeyboardButton("🔊 Unmute", callback_data=f"mod:unmute:{chat_id}:{target_id}"),
+             InlineKeyboardButton("🔓 Unban", callback_data=f"mod:unban:{chat_id}:{target_id}")]
         ])
         await msg.reply_text(f"Choose action for user {target_id}:", reply_markup=kb)
     else:
-        await moderate_message(update, context)
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            await moderate_message(update, context)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     WIZARD.pop(update.effective_user.id, None)
